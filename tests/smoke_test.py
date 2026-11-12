@@ -23,6 +23,7 @@ def tw(*args, check=True):
 
 def main():
     os.environ["TAILWAKE_HOME"] = tempfile.mkdtemp(prefix="tailwake-test-")
+    os.environ["TAILWAKE_DEBUG"] = "1"
     os.environ.pop("DISPLAY", None)
     os.environ.pop("WAYLAND_DISPLAY", None)
     tw("add", "Test Box", "02:00:00:00:00:01", "--ip", "192.0.2.10")
@@ -45,8 +46,9 @@ def main():
     finally:
         tw("stop", check=False)
         log = os.path.join(os.environ["TAILWAKE_HOME"], "tailwake.log")
-        if os.path.exists(log):
-            print(open(log, encoding="utf-8").read())
+        for name in (log, os.path.join(os.environ["TAILWAKE_HOME"], "stacks.txt")):
+            if os.path.exists(name):
+                print(open(name, encoding="utf-8").read())
     assert tw("status", check=False).returncode == 3, "still running after stop"
     print("smoke test OK")
 

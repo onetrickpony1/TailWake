@@ -2080,6 +2080,10 @@ def cmd_run(args) -> int:
         log.info("TailWake is already running")
         return 0
     log.info("TailWake %s starting (%s, Python %s)", VERSION, platform.platform(), platform.python_version())
+    if os.environ.get("TAILWAKE_DEBUG"):
+        import faulthandler
+        dump = open(os.path.join(config_dir(), "stacks.txt"), "w")
+        faulthandler.dump_traceback_later(6, repeat=False, file=dump)
     return App().run(tray=not args.no_tray)
 
 
