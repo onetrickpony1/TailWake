@@ -809,6 +809,17 @@ DENIED_PAGE = """<!doctype html><meta charset="utf-8"><meta name="viewport" cont
 <p>Your address: %s</p></body>"""
 
 
+class QuickServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer without the reverse-DNS lookup in server_bind (socket.getfqdn can hang on macOS)."""
+    daemon_threads = True
+    allow_reuse_address = not IS_WIN          # on Windows this would let two programs share the port
+
+    def server_bind(self):
+        import socketserver
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
+
+
 class WebHandler(BaseHTTPRequestHandler):
     server_version = "TailWake/" + VERSION
     app = None          # set by App
@@ -1009,13 +1020,8 @@ class App:
             if self.server:
                 return True
             WebHandler.app = self
-
-            class Server(ThreadingHTTPServer):
-                daemon_threads = True
-                allow_reuse_address = not IS_WIN      # on Windows this would let two programs share the port
-
             try:
-                srv = Server(("0.0.0.0", self.cfg["port"]), WebHandler)
+                srv = QuickServer(("0.0.0.0", self.cfg["port"]), WebHandler)
             except OSError as e:
                 self.server_error = "Port %d can't be used (%s). Pick another port in Settings." % (
                     self.cfg["port"], e.strerror or e)
@@ -1046,11 +1052,7 @@ class App:
 
     def start_control(self) -> None:
         ControlHandler.app = self
-
-        class Server(ThreadingHTTPServer):
-            daemon_threads = True
-
-        self.control = Server(("127.0.0.1", 0), ControlHandler)
+        self.control = QuickServer(("127.0.0.1", 0), ControlHandler)
         threading.Thread(target=self.control.serve_forever, name="control", daemon=True).start()
         write_json(state_path(), {"pid": os.getpid(), "control_port": self.control.server_address[1],
                                   "token": self.token, "version": VERSION})
