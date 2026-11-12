@@ -1,0 +1,54 @@
+name: tests
+
+on: [push, pull_request]
+
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python: ["3.10", "3.13"]
+        include:
+          - os: ubuntu-latest
+            python: "3.9"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m py_compile tailwake.py
+      - run: python tailwake.py selftest
+      - run: python tailwake.py --version
+      - run: python tests/smoke_test.py
+
+  installer:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      TAILWAKE_SOURCE: ${{ github.workspace }}/tailwake.py
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: install.sh
+        if: runner.os != 'Windows'
+        run: |
+          sh install.sh
+          "$HOME/.local/bin/tailwake" --version
+          "$HOME/.local/share/tailwake/venv/bin/python" -c "import pystray, PIL"
+      - name: install.ps1
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          powershell -ExecutionPolicy ByPass -File install.ps1
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          & "$env:LOCALAPPDATA\TailWake\tailwake.cmd" --version
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          & "$env:LOCALAPPDATA\TailWake\venv\Scripts\python.exe" -c "import pystray, PIL"
+          if ($LASTEXITCODE -ne 0) { exit 1 }
