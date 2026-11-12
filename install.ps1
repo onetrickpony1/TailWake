@@ -61,7 +61,7 @@ if (-not (Test-Path $venvPy)) {
     Say "Creating TailWake's private Python environment"
     if (-not (Try-Py $py @("-m", "venv", (Join-Path $Dir "venv")))) { throw "could not create the Python environment" }
 }
-if (-not (Try-Py $venvPy @("-c", "import pystray, PIL"))) {
+if (-not (Try-Py $venvPy @("-c", "import importlib.util as u, PIL, sys; sys.exit(not u.find_spec('pystray'))"))) {
     if (Ask "Install the tray icon packages (pystray, Pillow) into TailWake's own folder? Recommended. [Y/n]" "y") {
         if (-not (Try-Py $venvPy @("-m", "pip", "install", "--quiet", "--disable-pip-version-check", "pystray", "Pillow"))) {
             Write-Host "Could not install them; TailWake still works, just without a tray icon."

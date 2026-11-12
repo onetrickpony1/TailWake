@@ -75,7 +75,7 @@ if [ ! -x "$DIR/venv/bin/python" ]; then
 fi
 PY="$DIR/venv/bin/python"
 
-if ! "$PY" -c "import pystray, PIL" >/dev/null 2>&1; then
+if ! "$PY" -c "import importlib.util as u, PIL, sys; sys.exit(not u.find_spec('pystray'))" >/dev/null 2>&1; then
     if ask "Install the tray icon packages (pystray, Pillow) into TailWake's own folder? Recommended. [Y/n]" y; then
         "$PY" -m pip install --quiet --disable-pip-version-check pystray Pillow \
             || printf 'Could not install them; TailWake still works, just without a tray icon.\n'

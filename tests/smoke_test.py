@@ -27,8 +27,8 @@ def main():
     os.environ.pop("WAYLAND_DISPLAY", None)
     tw("add", "Test Box", "02:00:00:00:00:01", "--ip", "192.0.2.10")
     tw("config", "--port", str(PORT))
-    tw("start")
     try:
+        tw("start")
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         with opener.open("http://127.0.0.1:%d/" % PORT, timeout=10) as r:
             assert r.status == 200 and b"TailWake" in r.read()

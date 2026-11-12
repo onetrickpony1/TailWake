@@ -41,7 +41,7 @@ jobs:
         run: |
           sh install.sh
           "$HOME/.local/bin/tailwake" --version
-          "$HOME/.local/share/tailwake/venv/bin/python" -c "import pystray, PIL"
+          "$HOME/.local/share/tailwake/venv/bin/python" -c "import importlib.util as u, PIL; assert u.find_spec('pystray')"
       - name: install.ps1
         if: runner.os == 'Windows'
         shell: pwsh
@@ -50,5 +50,5 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit 1 }
           & "$env:LOCALAPPDATA\TailWake\tailwake.cmd" --version
           if ($LASTEXITCODE -ne 0) { exit 1 }
-          & "$env:LOCALAPPDATA\TailWake\venv\Scripts\python.exe" -c "import pystray, PIL"
+          & "$env:LOCALAPPDATA\TailWake\venv\Scripts\python.exe" -c "import importlib.util as u, PIL; assert u.find_spec('pystray')"
           if ($LASTEXITCODE -ne 0) { exit 1 }
