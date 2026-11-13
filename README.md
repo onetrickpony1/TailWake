@@ -31,12 +31,12 @@ start at login.
 
 **Windows** (PowerShell):
 ```
-powershell -ExecutionPolicy ByPass -c "irm https://raw.githubusercontent.com/onetrickpony1/TailWake/main/install.ps1 | iex"
+powershell -ExecutionPolicy ByPass -c "irm https://raw.githubusercontent.com/onetrickpony1/tailwake/main/install.ps1 | iex"
 ```
 
 **Linux and macOS** (Terminal):
 ```
-curl -LsSf https://raw.githubusercontent.com/onetrickpony1/TailWake/main/install.sh | sh
+curl -LsSf https://raw.githubusercontent.com/onetrickpony1/tailwake/main/install.sh | sh
 ```
 
 Run the same line again to update. Or skip the installer: `pip install pystray Pillow` (optional) and run

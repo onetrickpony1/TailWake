@@ -1,6 +1,6 @@
 # TailWake installer for Windows (PowerShell). No admin rights needed.
 #
-#   powershell -ExecutionPolicy ByPass -c "irm https://raw.githubusercontent.com/onetrickpony1/TailWake/main/install.ps1 | iex"
+#   powershell -ExecutionPolicy ByPass -c "irm https://raw.githubusercontent.com/onetrickpony1/tailwake/main/install.ps1 | iex"
 #
 # It checks what is missing and asks before installing anything:
 #   1. Python 3.9+ (needed)   2. the tray icon packages, privately in TailWake's own folder (recommended)
@@ -9,7 +9,7 @@
 # Uninstall: `tailwake autostart off`, `tailwake stop`, then delete that folder and the Start menu shortcut.
 $ErrorActionPreference = "Stop"
 
-$Url = if ($env:TAILWAKE_URL) { $env:TAILWAKE_URL } else { "https://raw.githubusercontent.com/onetrickpony1/TailWake/main/tailwake.py" }
+$Url = if ($env:TAILWAKE_URL) { $env:TAILWAKE_URL } else { "https://raw.githubusercontent.com/onetrickpony1/tailwake/main/tailwake.py" }
 $Dir = Join-Path $env:LOCALAPPDATA "TailWake"
 
 function Say($m) { Write-Host "`n==> $m" }

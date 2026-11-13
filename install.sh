@@ -1,7 +1,7 @@
 #!/bin/sh
 # TailWake installer for Linux and macOS. No admin rights needed (only to install missing system packages).
 #
-#   curl -LsSf https://raw.githubusercontent.com/onetrickpony1/TailWake/main/install.sh | sh
+#   curl -LsSf https://raw.githubusercontent.com/onetrickpony1/tailwake/main/install.sh | sh
 #
 # It checks what is missing and asks before installing anything:
 #   1. Python 3.9+ with tkinter (needed)   2. the tray icon packages, privately in TailWake's own folder (recommended)
@@ -11,7 +11,7 @@
 # ~/.local/bin/tailwake and the menu entry / app.
 set -eu
 
-URL="${TAILWAKE_URL:-https://raw.githubusercontent.com/onetrickpony1/TailWake/main/tailwake.py}"
+URL="${TAILWAKE_URL:-https://raw.githubusercontent.com/onetrickpony1/tailwake/main/tailwake.py}"
 DIR="$HOME/.local/share/tailwake"
 BIN="$HOME/.local/bin"
 OS="$(uname)"

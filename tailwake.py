@@ -13,7 +13,7 @@ TailWake runs without an icon. The settings window needs tkinter.
     tailwake wake [NAME]     wake a device from the command line
     tailwake help            all commands
 
-https://github.com/onetrickpony1/TailWake  -  GNU GPL v3.0 or later
+https://github.com/onetrickpony1/tailwake  -  GNU GPL v3.0 or later
 """
 from __future__ import annotations
 
@@ -44,7 +44,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 APP = "TailWake"
 VERSION = "1.0.0"
-REPO = "https://github.com/onetrickpony1/TailWake"
+REPO = "https://github.com/onetrickpony1/tailwake"
 DEFAULT_PORT = 8002
 WAKE_WATCH_SECONDS = 180          # after a wake, keep checking this long to report when it comes up
 VIEW_WINDOW_SECONDS = 30          # the page counts as "open" this long after its last status request
