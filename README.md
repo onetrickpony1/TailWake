@@ -107,6 +107,6 @@ TailWake runs without a tray icon when there is no desktop. Add devices with `ta
 - **The magic packet** goes to 255.255.255.255, the local /24 broadcast and the device's last IP address, on UDP ports
   9 and 7. If your network is not a /24, set the device's broadcast address in its settings.
 
-## Licence
+## License
 
 GNU General Public License v3.0 or later. See [LICENSE](LICENSE).
