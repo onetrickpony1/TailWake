@@ -4,7 +4,7 @@
 A small background app with a tray icon. It serves a phone-friendly page to your Tailscale devices; tap Wake and
 it sends a Wake-on-LAN magic packet on its own local network.
 
-Standard-library Python 3.9+. The tray icon needs `pystray` and `Pillow` (the installers set them up); without them
+Standard-library Python 3.10+. The tray icon needs `pystray` and `Pillow` (the installers set them up); without them
 TailWake runs without an icon. The settings window needs tkinter.
 
     tailwake                 start in the background (or open settings if it is already running)
@@ -43,9 +43,10 @@ import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 APP = "TailWake"
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 REPO = "https://github.com/onetrickpony1/tailwake"
 DEFAULT_PORT = 8002
+MIN_PORT = 1024                   # lower ports need admin/root rights on Linux and macOS
 WAKE_WATCH_SECONDS = 180          # after a wake, keep checking this long to report when it comes up
 VIEW_WINDOW_SECONDS = 30          # the page counts as "open" this long after its last status request
 SWEEP_EVERY_SECONDS = 120         # at most one local-network sweep per this many seconds
@@ -128,24 +129,30 @@ DEFAULTS = {
 
 
 def load_config() -> dict:
+    """The settings, with defaults filled in. Keys and device fields this version doesn't know are kept so that
+    save_config writes them back. Devices whose MAC address doesn't parse are kept aside in "_invalid_devices"
+    (saved again, never used)."""
     cfg = dict(DEFAULTS)
     data = read_json(config_path(), {})
     if isinstance(data, dict):
-        cfg.update({k: v for k, v in data.items() if k in DEFAULTS})
+        cfg.update({k: v for k, v in data.items() if not k.startswith("_")})
     if not cfg["secret"]:
         cfg["secret"] = secrets.token_hex(16)
         save_config(cfg)
-    devices = []
+    devices, invalid = [], []
     for d in cfg.get("devices") or []:
-        if isinstance(d, dict) and normalize_mac(d.get("mac", "")):
-            devices.append({
+        if isinstance(d, dict) and normalize_mac(str(d.get("mac") or "")):
+            devices.append(dict(d, **{
                 "id": str(d.get("id") or secrets.token_hex(4)),
                 "name": str(d.get("name") or "Device").strip() or "Device",
-                "mac": normalize_mac(d["mac"]),
+                "mac": normalize_mac(str(d["mac"])),
                 "ip": str(d.get("ip") or "").strip(),
                 "broadcast": str(d.get("broadcast") or "").strip(),
-            })
+            }))
+        else:
+            invalid.append(d)
     cfg["devices"] = devices
+    cfg["_invalid_devices"] = invalid
     try:
         cfg["port"] = int(cfg["port"])
     except (TypeError, ValueError):
@@ -160,7 +167,21 @@ def load_config() -> dict:
 
 
 def save_config(cfg: dict) -> None:
-    write_json(config_path(), {k: cfg.get(k, DEFAULTS[k]) for k in DEFAULTS})
+    out = {k: v for k, v in cfg.items() if not k.startswith("_")}
+    for k, v in DEFAULTS.items():
+        out.setdefault(k, v)
+    names = {str(d.get("name") or "").strip().lower() for d in cfg.get("devices") or [] if isinstance(d, dict)}
+    out["devices"] = list(cfg.get("devices") or []) + [      # an unreadable device stays until one replaces it
+        d for d in cfg.get("_invalid_devices") or []
+        if not (isinstance(d, dict) and str(d.get("name") or "").strip().lower() in names)]
+    write_json(config_path(), out)
+
+
+def port_problem(port) -> str:
+    """'' if `port` can be used for the web page, else why not."""
+    if not isinstance(port, int) or not MIN_PORT <= port <= 65535:
+        return "The port must be a number from %d to 65535." % MIN_PORT
+    return ""
 
 
 def hash_password(password: str, salt: str = "") -> tuple:
@@ -181,6 +202,15 @@ def set_password(cfg: dict, password: str) -> None:
         cfg["password_hash"], cfg["password_salt"] = hash_password(password)
     else:
         cfg["password_hash"] = cfg["password_salt"] = ""
+
+
+def ensure_network_password(cfg: dict) -> str:
+    """Local-network access needs a password: make one if it is on without one. Returns the new password or ''."""
+    if cfg.get("access") == "network" and not cfg.get("password_hash"):
+        password = secrets.token_urlsafe(9)
+        set_password(cfg, password)
+        return password
+    return ""
 
 
 def find_device(cfg: dict, key: str):
@@ -621,24 +651,278 @@ def tailscale_info() -> dict:
     return info
 
 
-def tailscale_serve(port: int, on: bool) -> tuple:
-    """Turn the tailnet-only HTTPS address (Tailscale Serve) on or off. Returns (ok, message)."""
+SERVE_HTTPS_PORTS = (443, 8443, 10000)          # the HTTPS ports Tailscale Serve can use
+
+
+def serve_config():
+    """Tailscale Serve's current settings (`tailscale serve status --json`), or None if they can't be read."""
     cli = tailscale_cli()
     if not cli:
-        return False, "The Tailscale command line tool was not found."
-    if on:
-        cmd = [cli, "serve", "--bg", "http://127.0.0.1:%d" % port]
-    else:
-        cmd = [cli, "serve", "--https=443", "off"]
-    code, out = run_quiet(cmd, timeout=25)
+        return None
+    code, out = run_quiet([cli, "serve", "status", "--json"], timeout=10)
+    if code != 0:
+        return None
+    if "{" not in out:
+        return {}                                   # nothing is being served
+    try:
+        data = json.loads(out[out.index("{"):])
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _local_port(target: str):
+    """'http://127.0.0.1:8002' or 'localhost:8002' -> 8002; anything that isn't a local HTTP server -> None."""
+    u = urllib.parse.urlsplit(target if "://" in target else "http://" + target)
+    try:
+        port = u.port
+    except ValueError:
+        return None
+    if u.scheme == "http" and (u.hostname or "").lower() in ("127.0.0.1", "localhost", "::1"):
+        return port or 80
+    return None
+
+
+def serve_handlers(conf: dict) -> list:
+    """Every HTTPS handler in a Serve config: [{"host", "https_port", "path", "target", "local_port"}]."""
+    out = []
+    for hostport, web in sorted(((conf or {}).get("Web") or {}).items()):
+        host, _, p = hostport.rpartition(":")
+        try:
+            https_port = int(p)
+        except ValueError:
+            continue
+        for path, h in sorted(((web or {}).get("Handlers") or {}).items()):
+            h = h or {}
+            target = h.get("Proxy") or ""
+            out.append({"host": host, "https_port": https_port, "path": path,
+                        "target": target or ("files" if h.get("Path") else "text"),
+                        "local_port": _local_port(target) if target else None})
+    return out
+
+
+def serve_url(host: str, https_port: int, path: str = "/") -> str:
+    return "https://%s%s%s" % (host, "" if https_port == 443 else ":%d" % https_port, path)
+
+
+def serve_urls(conf: dict, port: int) -> list:
+    """The https://...ts.net addresses that currently forward to TailWake on `port`."""
+    return [serve_url(h["host"], h["https_port"]) for h in serve_handlers(conf)
+            if h["local_port"] == port and h["path"] == "/"]
+
+
+def serve_free_port(conf: dict, port: int):
+    """The first HTTPS port where TailWake can go at "/" without replacing something else, or None."""
+    handlers = serve_handlers(conf)
+    for hp in SERVE_HTTPS_PORTS:
+        tcp = ((conf or {}).get("TCP") or {}).get(str(hp)) or {}
+        if tcp and not tcp.get("HTTPS"):
+            continue                                # a raw TCP forwarder uses this port
+        if all(h["local_port"] == port for h in handlers if h["https_port"] == hp and h["path"] == "/"):
+            return hp
+    return None
+
+
+def _serve_failed(code: int, out: str) -> str:
     out = out.strip()
-    if code == 0:
-        return True, out or ("HTTPS address turned on." if on else "HTTPS address turned off.")
     if code == -1 and not out:
         out = "Tailscale did not answer in time. If it printed a link to enable HTTPS, open the Tailscale admin page."
     if "access denied" in out.lower() or "operator" in out.lower():
-        out += ("\n\nOn Linux, allow your user once with:\n  sudo tailscale set --operator=$USER")
-    return False, out
+        out += "\n\nOn Linux, allow your user once with:\n  sudo tailscale set --operator=$USER"
+    return out or "Tailscale Serve failed (exit code %d)." % code
+
+
+def tailscale_serve(port: int, on: bool) -> tuple:
+    """Turn the tailnet-only HTTPS address (Tailscale Serve) on or off. Returns (ok, message).
+    Only TailWake's own handler is added or removed: other things served by Tailscale Serve are left alone."""
+    cli = tailscale_cli()
+    if not cli:
+        return False, "The Tailscale command line tool was not found."
+    conf = serve_config()
+    if conf is None:
+        return False, ("Couldn't read Tailscale Serve's current settings (`tailscale serve status --json`), so "
+                       "nothing was changed. Is Tailscale running and up to date?")
+    mine = [h for h in serve_handlers(conf) if h["local_port"] == port]
+    if not on:
+        if not mine:
+            return True, "The HTTPS address is already off."
+        for h in mine:
+            code, out = run_quiet([cli, "serve", "--https=%d" % h["https_port"], "--set-path", h["path"], "off"],
+                                  timeout=25)
+            if code != 0:
+                return False, _serve_failed(code, out)
+        return True, "HTTPS address turned off. Anything else Tailscale Serve shares was left as it was."
+    urls = serve_urls(conf, port)
+    if urls:
+        return True, "The HTTPS address is already on: " + urls[0]
+    hp = serve_free_port(conf, port)
+    if hp is None:
+        return False, ("Tailscale Serve already uses HTTPS ports %s for other things, so TailWake didn't change "
+                       "them. Free one of them (see `tailscale serve status`) and try again."
+                       % ", ".join(map(str, SERVE_HTTPS_PORTS)))
+    code, out = run_quiet([cli, "serve", "--bg", "--https=%d" % hp, "http://127.0.0.1:%d" % port], timeout=25)
+    if code != 0:
+        return False, _serve_failed(code, out)
+    after = serve_urls(serve_config() or {}, port)
+    message = "HTTPS address turned on: %s" % (after[0] if after else serve_url(tailscale_info()["dns"] or "?", hp))
+    if hp != 443:
+        message += "\n\nPort 443 already serves something else, so TailWake used port %d and left that alone." % hp
+    return True, message
+
+
+def serve_follow_port(old_port: int, new_port: int) -> str:
+    """After a port change, point TailWake's Tailscale Serve handlers at the new port. Returns a message, or ''
+    when Serve didn't point at TailWake."""
+    cli = tailscale_cli()
+    conf = serve_config() if cli and old_port != new_port else None
+    mine = [h for h in serve_handlers(conf or {}) if h["local_port"] == old_port]
+    if not mine:
+        return ""
+    for h in mine:
+        flags = ["--https=%d" % h["https_port"], "--set-path", h["path"]]
+        code, out = run_quiet([cli, "serve"] + flags + ["off"], timeout=25)
+        if code == 0:
+            code, out = run_quiet([cli, "serve", "--bg"] + flags + ["http://127.0.0.1:%d" % new_port], timeout=25)
+        if code != 0:
+            log.warning("Couldn't move the HTTPS address to port %d: %s", new_port, _serve_failed(code, out))
+            return ("The HTTPS address still forwards to the old port %d and Tailscale didn't let TailWake change "
+                    "it. Press \u201cTurn HTTPS address on\u201d in Settings \u2192 Tailscale.\n" % old_port)
+    log.info("HTTPS address now forwards to port %d", new_port)
+    return "The HTTPS address now forwards to the new port %d.\n" % new_port
+
+
+_whois_cache = {}
+
+
+def tailscale_whois(ip: str) -> bool:
+    """True if `ip` is a device on this tailnet according to `tailscale whois` (cached for 5 minutes)."""
+    hit = _whois_cache.get(ip)
+    if hit and time.time() - hit[1] < 300:
+        return hit[0]
+    cli = tailscale_cli()
+    ok = bool(cli) and run_quiet([cli, "whois", ip], timeout=5)[0] == 0
+    _whois_cache[ip] = (ok, time.time())
+    return ok
+
+
+def parse_ip_addr(text: str) -> list:
+    """`ip -o addr show` (Linux) -> ['192.168.1.5/24', ...]."""
+    return re.findall(r"\binet6?\s+([0-9a-fA-F.:]+/\d+)", text)
+
+
+def parse_ifconfig(text: str) -> list:
+    """`ifconfig` (macOS/BSD) -> ['192.168.1.5/24', 'fe80::1/64', ...]."""
+    out = []
+    for m in re.finditer(r"\binet\s+(\d+\.\d+\.\d+\.\d+)\s+netmask\s+(0x[0-9a-fA-F]{8}|\d+\.\d+\.\d+\.\d+)", text):
+        mask = m.group(2)
+        bits = bin(int(mask, 16)).count("1") if mask.startswith("0x") else \
+            ipaddress.ip_network("0.0.0.0/" + mask).prefixlen
+        out.append("%s/%d" % (m.group(1), bits))
+    for m in re.finditer(r"\binet6\s+([0-9a-fA-F:]+)(?:%\S+)?\s+prefixlen\s+(\d+)", text):
+        out.append("%s/%s" % (m.group(1), m.group(2)))
+    return out
+
+
+def parse_prefix_lines(text: str) -> list:
+    """Lines of 'address/prefix' (Windows PowerShell) -> the same, without zone ids like %12."""
+    out = []
+    for line in text.splitlines():
+        m = re.fullmatch(r"\s*([0-9a-fA-F.:]+)(?:%\S+)?/(\d+)\s*", line)
+        if m:
+            out.append("%s/%s" % (m.group(1), m.group(2)))
+    return out
+
+
+_networks = {"time": 0.0, "nets": []}
+
+
+def local_networks(max_age: float = 60) -> list:
+    """The networks this computer's own interfaces are on (no loopback, no single-address links such as
+    Tailscale's own). Cached."""
+    if time.time() - _networks["time"] < max_age:
+        return _networks["nets"]
+    if IS_WIN:
+        rows = parse_prefix_lines(run_quiet(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+             "Get-NetIPAddress | ForEach-Object { $_.IPAddress + '/' + $_.PrefixLength }"], timeout=15)[1])
+    elif IS_MAC or not sys.platform.startswith("linux"):
+        rows = parse_ifconfig(run_quiet(["ifconfig"], timeout=5)[1])
+    else:
+        rows = parse_ip_addr(run_quiet(["ip", "-o", "addr", "show"], timeout=5)[1])
+    own_ts = local_ip_toward("100.100.100.100")          # this computer's Tailscale address, if connected
+    own_ts = ipaddress.ip_address(own_ts) if own_ts and in_tailscale_range(own_ts) else None
+    nets = []
+    for row in rows:
+        try:
+            n = ipaddress.ip_network(row, strict=False)
+        except ValueError:
+            continue
+        if n.is_loopback or n.prefixlen >= n.max_prefixlen - 1 or n in nets or (own_ts and own_ts in n):
+            continue
+        nets.append(n)
+    if not nets:                                   # couldn't list the interfaces: the /24 around the LAN address
+        lan = local_ip_toward()
+        if lan and not in_tailscale_range(lan):
+            nets.append(subnet_24(lan))
+    _networks.update(time=time.time(), nets=nets)
+    return nets
+
+
+def is_tailnet_address(a) -> bool:
+    """Is this client address a Tailscale device? 100.64.0.0/10 is also used by some local networks (carrier-grade
+    NAT): when this computer itself is on such a network, ask Tailscale to confirm."""
+    if not in_tailscale_range(str(a)):
+        return False
+    if any(a in n for n in local_networks() if n.version == a.version and in_tailscale_range(str(n[0]))):
+        return tailscale_whois(str(a))
+    return True
+
+
+def is_local_network_address(a) -> bool:
+    return (a.is_private or a.is_link_local) and any(a in n for n in local_networks())
+
+
+class LoginGuard:
+    """Limits password guesses: `tries` attempts per address, then a lock-out that starts at `first_lock` seconds
+    and doubles up to `max_lock`; plus at most `global_tries` attempts per minute from all addresses together.
+    An attempt is counted before the password is checked, so parallel requests can't slip past the limit."""
+
+    def __init__(self, tries=5, first_lock=60, max_lock=3600, global_tries=30):
+        self.tries, self.first_lock, self.max_lock, self.global_tries = tries, first_lock, max_lock, global_tries
+        self.lock = threading.Lock()
+        self.by_client = {}
+        self.recent = []
+        self.global_logged = 0.0
+
+    def attempt(self, client: str) -> int:
+        """0 if this login attempt may go ahead, else the seconds to wait."""
+        with self.lock:
+            now = time.time()
+            if len(self.by_client) > 2000:
+                self.by_client = {k: e for k, e in self.by_client.items()
+                                  if e["until"] > now or now - e["seen"] < 86400}
+            e = self.by_client.setdefault(client, {"n": 0, "until": 0.0, "lock": 0, "seen": now})
+            if now < e["until"]:
+                return int(e["until"] - now) + 1
+            self.recent = [t for t in self.recent if now - t < 60]
+            if len(self.recent) >= self.global_tries:
+                if now - self.global_logged > 60:
+                    self.global_logged = now
+                    log.warning("Too many login attempts overall: pausing logins for a minute")
+                return int(60 - (now - self.recent[0])) + 1
+            self.recent.append(now)
+            e["n"] += 1
+            e["seen"] = now
+            if e["n"] >= self.tries:
+                e["lock"] = min(self.max_lock, e["lock"] * 2 or self.first_lock)
+                e["until"] = now + e["lock"]
+                e["n"] = self.tries - 1          # after the lock-out: one more try, then a longer lock-out
+                log.warning("Too many wrong passwords from %s: logins from there blocked for %d s", client, e["lock"])
+            return 0
+
+    def success(self, client: str) -> None:
+        with self.lock:
+            self.by_client.pop(client, None)
 
 
 def page_urls(cfg: dict, ts: dict) -> list:
@@ -805,13 +1089,14 @@ LOGIN_BODY = """<body>
 
 DENIED_PAGE = """<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>TailWake</title><body style="font-family:system-ui,sans-serif;max-width:520px;margin:10vh auto;padding:0 16px">
-<h1>Not allowed</h1><p>This TailWake only answers devices on your Tailscale network%s.</p>
+<h1>Not allowed</h1><p>%s</p>
 <p>Your address: %s</p></body>"""
 
 
 class QuickServer(ThreadingHTTPServer):
     """ThreadingHTTPServer without the reverse-DNS lookup in server_bind (socket.getfqdn can hang on macOS)."""
     daemon_threads = True
+    request_queue_size = 64                   # a phone opens several connections at once
     allow_reuse_address = not IS_WIN          # on Windows this would let two programs share the port
 
     def server_bind(self):
@@ -846,19 +1131,73 @@ class WebHandler(BaseHTTPRequestHandler):
     def _json(self, code: int, obj):
         self._send(code, json.dumps(obj), "application/json; charset=utf-8")
 
-    def _allowed(self) -> bool:
-        ip = self.client_address[0]
+    def _client(self):
         try:
-            a = ipaddress.ip_address(ip)
+            a = ipaddress.ip_address(self.client_address[0].split("%")[0])
         except ValueError:
-            return False
+            return None
         if isinstance(a, ipaddress.IPv6Address) and a.ipv4_mapped:
             a = a.ipv4_mapped
-        if a.is_loopback or in_tailscale_range(str(a)):
+        return a
+
+    def _allowed(self) -> bool:
+        a = self._client()
+        if a is None:
+            return False
+        if a.is_loopback or is_tailnet_address(a):
             return True
-        if self.app.cfg["access"] == "network":
-            return a.is_private or a.is_link_local
-        return False
+        cfg = self.app.cfg
+        return cfg["access"] == "network" and bool(cfg.get("password_hash")) and is_local_network_address(a)
+
+    def _denied_reason(self) -> str:
+        cfg = self.app.cfg
+        if cfg["access"] != "network":
+            return "This TailWake only answers devices on your Tailscale network."
+        if not cfg.get("password_hash"):
+            return ("This TailWake only answers devices on your Tailscale network. Local network access is switched "
+                    "on but needs a password: set one in TailWake's settings.")
+        return "This TailWake only answers devices on your Tailscale network and its own local network."
+
+    def _host_ok(self) -> bool:
+        """Only answer requests addressed to this computer (stops DNS rebinding from other websites)."""
+        host = (self.headers.get("Host") or "").strip().lower()
+        if not host:
+            return True
+        if host.startswith("["):
+            name = host[1:host.find("]")] if "]" in host else host
+        else:
+            name = host.rsplit(":", 1)[0] if host.count(":") == 1 else host
+        name = name.rstrip(".")
+        if name == "localhost":
+            return True
+        try:
+            ipaddress.ip_address(name.split("%")[0])
+            return True
+        except ValueError:
+            pass
+        return name in self.app.host_names()
+
+    def _check_request(self) -> bool:
+        """Host and client address checks for every request. Sends the refusal and returns False if not allowed."""
+        if not self._host_ok():
+            log.info("Refused a request from %s for host %r", self.client_address[0], self.headers.get("Host"))
+            self._send(421, "This TailWake doesn't answer to that host name.", "text/plain; charset=utf-8")
+            return False
+        if not self._allowed():
+            if self.command == "POST":
+                self._send(403, "Not allowed", "text/plain; charset=utf-8")
+            else:
+                self._send(403, DENIED_PAGE % (self._denied_reason(), self.client_address[0]))
+            return False
+        return True
+
+    def _login_key(self) -> str:
+        """Who is guessing: the client address, or the original one when Tailscale Serve proxies from loopback."""
+        a = self._client()
+        forwarded = (self.headers.get("X-Forwarded-For") or "").split(",")[-1].strip()
+        if a is not None and a.is_loopback and forwarded:
+            return forwarded
+        return self.client_address[0]
 
     def _cookie_value(self) -> str:
         cfg = self.app.cfg
@@ -885,9 +1224,8 @@ class WebHandler(BaseHTTPRequestHandler):
         self.do_GET()
 
     def do_GET(self):
-        if not self._allowed():
-            extra = "" if self.app.cfg["access"] == "tailscale" else " and its local network"
-            return self._send(403, DENIED_PAGE % (extra, self.client_address[0]))
+        if not self._check_request():
+            return None
         path = urllib.parse.urlsplit(self.path).path
         query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
         if path == "/icon.svg":
@@ -907,16 +1245,23 @@ class WebHandler(BaseHTTPRequestHandler):
         self._send(404, "Not found", "text/plain; charset=utf-8")
 
     def do_POST(self):
-        if not self._allowed():
-            return self._send(403, "Not allowed", "text/plain; charset=utf-8")
+        if not self._check_request():
+            return None
         path = urllib.parse.urlsplit(self.path).path
         if path == "/login":
             form = urllib.parse.parse_qs(self._body().decode("utf-8", "replace"))
+            who = self._login_key()
+            wait = self.app.logins.attempt(who)
+            if wait:
+                notice = '<div class="notice bad">Too many wrong passwords. Try again in %s.</div>' % (
+                    "%d minutes" % ((wait + 59) // 60) if wait > 90 else "%d seconds" % wait)
+                return self._send(429, PAGE_HEAD + LOGIN_BODY % notice, headers={"Retry-After": str(wait)})
             if check_password(self.app.cfg, (form.get("password") or [""])[0]):
+                self.app.logins.success(who)
                 cookie = "tailwake=%s; Path=/; Max-Age=31536000; HttpOnly; SameSite=Strict" % self._cookie_value()
                 return self._send(303, "", headers={"Location": "/", "Set-Cookie": cookie})
             time.sleep(1.0)
-            log.info("Wrong password from %s", self.client_address[0])
+            log.info("Wrong password from %s", who)
             return self._send(401, PAGE_HEAD + LOGIN_BODY % '<div class="notice bad">Wrong password.</div>')
         if path == "/api/wake":
             if not self._authed():
@@ -1002,6 +1347,7 @@ class App:
         self.tray = None
         self._ts = {}
         self._ts_time = 0.0
+        self.logins = LoginGuard()
 
     # -- tailscale (cached)
     def tailscale(self, max_age: float = 30) -> dict:
@@ -1009,6 +1355,15 @@ class App:
             self._ts = tailscale_info()
             self._ts_time = time.time()
         return self._ts
+
+    def host_names(self) -> set:
+        """Host names this computer answers to: its own name and its Tailscale (MagicDNS) name."""
+        short = socket.gethostname().lower().rstrip(".")
+        names = {short, short.split(".")[0], short.split(".")[0] + ".local"}
+        dns = (self.tailscale().get("dns") or "").lower()
+        if dns:
+            names.update((dns, dns.split(".")[0]))
+        return names
 
     def url(self) -> str:
         urls = page_urls(self.cfg, self.tailscale())
@@ -1069,9 +1424,11 @@ class App:
             ids = {d["id"] for d in self.cfg["devices"]}
             self.status = {k: v for k, v in self.status.items() if k in ids}
         log.info("Settings reloaded")
-        if self.cfg["port"] != old_port and self.server:
-            self.stop_server()
-            self.start_server()
+        if self.cfg["port"] != old_port:
+            threading.Thread(target=serve_follow_port, args=(old_port, self.cfg["port"]), daemon=True).start()
+            if self.server:
+                self.stop_server()
+                self.start_server()
         elif not self.server and self.server_error:
             self.start_server()
         self.check_event.set()
@@ -1220,6 +1577,13 @@ class App:
         self.start_server()
         threading.Thread(target=self.checker, name="checker", daemon=True).start()
         threading.Thread(target=self.tailscale, kwargs={"max_age": 0}, daemon=True).start()
+        threading.Thread(target=local_networks, daemon=True).start()
+        if self.cfg["access"] == "network" and not self.cfg["password_hash"]:
+            log.warning("Local network access is on but no password is set, so only Tailscale devices can open the "
+                        "page. Set a password in Settings or with `tailwake config --password`.")
+        for d in self.cfg["_invalid_devices"]:
+            log.warning("A device in %s has an unreadable MAC address and is skipped until it is fixed: %s",
+                        config_path(), (d.get("name") if isinstance(d, dict) else None) or repr(d)[:60])
         if not IS_WIN:
             import signal
             for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
@@ -1642,6 +2006,11 @@ def settings_window(start_tab: str = "") -> int:
         tree.heading(col, text=title)
         tree.column(col, width=width)
     tree.pack(fill="both", expand=True, padx=10)
+    if cfg["_invalid_devices"]:
+        ttk.Label(tab, foreground="#b42318", wraplength=520, text=(
+            "%d device(s) in the settings file have a MAC address TailWake can't read and are skipped. They are kept "
+            "in the file: fix them there (App tab \u2192 Open settings folder) or add them again here."
+            % len(cfg["_invalid_devices"]))).pack(anchor="w", padx=10, pady=(4, 0))
 
     def refresh_tree():
         tree.delete(*tree.get_children())
@@ -1808,13 +2177,13 @@ def settings_window(start_tab: str = "") -> int:
     ttk.Label(f, text="Who can open the page").grid(row=1, column=0, sticky="nw", pady=(12, 0))
     ttk.Radiobutton(f, text="Only my Tailscale devices (recommended)", variable=access_var,
                     value="tailscale").grid(row=1, column=1, sticky="w", padx=8, pady=(12, 0))
-    ttk.Radiobutton(f, text="My Tailscale devices and anyone on this local network", variable=access_var,
-                    value="network").grid(row=2, column=1, sticky="w", padx=8)
+    ttk.Radiobutton(f, text="My Tailscale devices and anyone on this local network (needs a password)",
+                    variable=access_var, value="network").grid(row=2, column=1, sticky="w", padx=8)
     ttk.Label(f, text="Password").grid(row=3, column=0, sticky="w", pady=(12, 0))
     ttk.Entry(f, textvariable=pw_var, show="\u2022", width=24).grid(row=3, column=1, sticky="w", padx=8,
                                                                     pady=(12, 0))
     pw_note = "A password is set. Type a new one to change it." if cfg["password_hash"] else \
-        "Optional. Leave empty for no password."
+        "Optional for Tailscale devices only. For the local network, TailWake makes one if you leave it empty."
     ttk.Label(f, text=pw_note, foreground="#666").grid(row=4, column=1, sticky="w", padx=8)
     if cfg["password_hash"]:
         ttk.Checkbutton(f, text="Remove the password", variable=clear_pw).grid(row=5, column=1, sticky="w", padx=8)
@@ -1843,10 +2212,11 @@ def settings_window(start_tab: str = "") -> int:
     ts_bar = ttk.Frame(tab)
     ts_bar.pack(fill="x", padx=10, pady=4)
 
-    def show_ts(info):
+    def show_ts(result):
         for w in url_frame.winfo_children():
             w.destroy()
-        if isinstance(info, Exception) or not info.get("installed"):
+        info, conf = result if isinstance(result, tuple) else ({}, None)
+        if not info.get("installed"):
             ts_status.config(text="Tailscale isn't installed on this computer. Install it and sign in, then "
                                   "press Check again. Your phone needs Tailscale too.")
             return
@@ -1855,14 +2225,19 @@ def settings_window(start_tab: str = "") -> int:
                              % (info.get("state") or "stopped"))
             return
         who = info.get("dns") or info.get("ip")
-        ts_status.config(text="Connected to Tailscale as %s." % who)
         try:
             port = int(port_var.get())
         except ValueError:
             port = cfg["port"]
-        urls = page_urls(dict(cfg, port=port), info)
-        if info.get("dns"):
-            urls.append("https://%s/" % info["dns"])
+        https = serve_urls(conf or {}, port)
+        if https:
+            serving = "The HTTPS address is on."
+        elif conf is None:
+            serving = "Couldn't check whether the HTTPS address is on."
+        else:
+            serving = "The HTTPS address is off."
+        ts_status.config(text="Connected to Tailscale as %s. %s" % (who, serving))
+        urls = page_urls(dict(cfg, port=port), info) + https
         for i, u in enumerate(urls):
             e = ttk.Entry(url_frame, width=46)
             e.insert(0, u)
@@ -1871,22 +2246,21 @@ def settings_window(start_tab: str = "") -> int:
             ttk.Button(url_frame, text="Copy", command=lambda u=u: (root.clipboard_clear(), root.clipboard_append(u))
                        ).grid(row=i, column=1, padx=4)
             ttk.Button(url_frame, text="Open", command=lambda u=u: webbrowser.open(u)).grid(row=i, column=2)
-            if u.startswith("https://"):
-                ttk.Label(url_frame, text="(needs the HTTPS address on)", foreground="#666").grid(row=i, column=3,
-                                                                                                padx=4)
 
     def check_ts():
         ts_status.config(text="Checking Tailscale\u2026")
-        in_background(tailscale_info, show_ts)
+        in_background(lambda: (tailscale_info(), serve_config()), show_ts)
 
     def serve(on):
         try:
             port = int(port_var.get())
         except ValueError:
             port = cfg["port"]
-        in_background(lambda: tailscale_serve(port, on),
-                      lambda r: messagebox.showinfo("Tailscale Serve", r[1] if not isinstance(r, Exception)
-                                                    else str(r), parent=root))
+
+        def done(r):
+            messagebox.showinfo("Tailscale Serve", r[1] if not isinstance(r, Exception) else str(r), parent=root)
+            check_ts()
+        in_background(lambda: tailscale_serve(port, on), done)
 
     ttk.Button(ts_bar, text="Check again", command=check_ts).pack(side="left")
     ttk.Button(ts_bar, text="Turn HTTPS address on", command=lambda: serve(True)).pack(side="left", padx=6)
@@ -1946,6 +2320,25 @@ def settings_window(start_tab: str = "") -> int:
     ttk.Label(tab, text="TailWake %s \u00b7 %s" % (VERSION, REPO), foreground="#666").pack(anchor="w", **pad)
     update_run()
 
+    def show_password(password):
+        win = tk.Toplevel(root)
+        win.title("TailWake password")
+        win.transient(root)
+        win.resizable(False, False)
+        ttk.Label(win, wraplength=380, justify="left", text=(
+            "Opening the page from the local network needs a password, so TailWake made one. Keep it somewhere "
+            "safe: it is only shown now. You can change it on the Web page tab.")).pack(anchor="w", padx=12, pady=10)
+        e = ttk.Entry(win, width=30, font=("TkFixedFont", 12))
+        e.insert(0, password)
+        e.config(state="readonly")
+        e.pack(anchor="w", padx=12)
+        bar = ttk.Frame(win)
+        bar.pack(fill="x", padx=12, pady=10)
+        ttk.Button(bar, text="Close", command=win.destroy).pack(side="right")
+        ttk.Button(bar, text="Copy", command=lambda: (root.clipboard_clear(), root.clipboard_append(password))
+                   ).pack(side="right", padx=6)
+        win.grab_set()
+
     # ---- bottom bar
     dirty = {"v": False}
     bottom = ttk.Frame(root)
@@ -1957,30 +2350,71 @@ def settings_window(start_tab: str = "") -> int:
         dirty["v"] = True
         saved_label.config(text="Unsaved changes")
 
+    loaded = {"devices": {d["id"]: dict(d) for d in cfg["devices"]}, "port": cfg["port"], "access": cfg["access"],
+              "background_checks": cfg["background_checks"], "notifications": cfg["notifications"]}
+
     def save():
         try:
             port = int(port_var.get())
-            if not 1 <= port <= 65535:
-                raise ValueError
         except ValueError:
-            messagebox.showerror("Settings", "The port must be a number from 1024 to 65535.", parent=root)
+            port = None
+        problem = port_problem(port)
+        if problem:
+            messagebox.showerror("Settings", problem, parent=root)
             return False
-        fresh = load_config()                      # keep the secret; take the edits from the window
-        fresh.update(devices=cfg["devices"], port=port, access=access_var.get(), background_checks=bg_var.get(),
-                     notifications=notify_var.get())
+        # Start from the file as it is now and apply only what was changed in this window, so changes made
+        # meanwhile (`tailwake add`, `tailwake config`, another settings window) are kept.
+        fresh = load_config()
+        window = {d["id"]: d for d in cfg["devices"]}
+        for did, before in loaded["devices"].items():
+            if did not in window:                                       # removed here
+                fresh["devices"] = [d for d in fresh["devices"] if d["id"] != did]
+        for d in cfg["devices"]:
+            before = loaded["devices"].get(d["id"])
+            if before == d:
+                continue                                                # unchanged here
+            on_disk = next((x for x in fresh["devices"] if x["id"] == d["id"]), None)
+            if on_disk is not None:
+                on_disk.update({k: d[k] for k in ("name", "mac", "ip", "broadcast")})
+            else:                                                       # added here (or removed meanwhile)
+                fresh["devices"].append(dict(d))
+        edits = {"port": port, "access": access_var.get(), "background_checks": bg_var.get(),
+                 "notifications": notify_var.get()}
+        fresh.update({k: v for k, v in edits.items() if v != loaded[k]})
         if clear_pw.get():
+            if fresh["access"] == "network":
+                messagebox.showerror("Settings", "Access from the local network needs a password. Switch to "
+                                     "\u201cOnly my Tailscale devices\u201d to remove it.", parent=root)
+                return False
             set_password(fresh, "")
         elif pw_var.get():
             set_password(fresh, pw_var.get())
+        new_password = ensure_network_password(fresh)
         save_config(fresh)
+        cfg.clear()
         cfg.update(fresh)
+        loaded.update(devices={d["id"]: dict(d) for d in cfg["devices"]}, **{k: cfg[k] for k in edits})
+        refresh_tree()
+        port_var.set(str(cfg["port"]))                                  # show what is saved, incl. changes from
+        access_var.set(cfg["access"])                                   # elsewhere
+        bg_var.set(cfg["background_checks"])
+        notify_var.set(cfg["notifications"])
+        pw_var.set("")
+        clear_pw.set(False)
         dirty["v"] = False
         reply = control("reload")
+        if not reply and fresh["port"] != loaded_port["v"]:
+            serve_follow_port(loaded_port["v"], fresh["port"])
+        loaded_port["v"] = fresh["port"]
         saved_label.config(text="Saved." if reply else "Saved. (TailWake isn't running: press Start on the App tab.)")
         if reply:
             show_run(reply)
+        if new_password:
+            show_password(new_password)
         check_ts()
         return True
+
+    loaded_port = {"v": cfg["port"]}
 
     def close():
         if dirty["v"]:
@@ -2157,10 +2591,20 @@ def cmd_devices(args) -> int:
     cfg = load_config()
     if not cfg["devices"]:
         print("No devices yet. Add one with `tailwake add NAME MAC [--ip IP]` or `tailwake settings`.")
+        print_invalid_devices(cfg)
         return 0
     for d in cfg["devices"]:
         print("%-20s %s  %s" % (d["name"], d["mac"].upper(), d["ip"] or "-"))
+    print_invalid_devices(cfg)
     return 0
+
+
+def print_invalid_devices(cfg: dict) -> None:
+    for d in cfg["_invalid_devices"]:
+        name = (d.get("name") if isinstance(d, dict) else None) or repr(d)[:40]
+        mac = d.get("mac") if isinstance(d, dict) else ""
+        print("%-20s skipped: the MAC address %r can't be read. Fix it in %s or with `tailwake add`."
+              % (name, mac, config_path()))
 
 
 def cmd_add(args) -> int:
@@ -2213,10 +2657,12 @@ def cmd_scan(args) -> int:
 
 def cmd_config(args) -> int:
     cfg = load_config()
+    old_port = cfg["port"]
     changed = False
     if args.port is not None:
-        if not 1 <= args.port <= 65535:
-            print("The port must be from 1 to 65535.")
+        problem = port_problem(args.port)
+        if problem:
+            print(problem)
             return 1
         cfg["port"], changed = args.port, True
     if args.access:
@@ -2225,18 +2671,30 @@ def cmd_config(args) -> int:
         cfg["background_checks"], changed = args.background_checks == "on", True
     if args.password is not None or args.no_password:
         if args.no_password:
+            if cfg["access"] == "network":
+                print("Access from the local network needs a password. Use --access tailscale to remove it.")
+                return 1
             set_password(cfg, "")
         else:
             pw = args.password
             if pw == "":
                 import getpass
                 pw = getpass.getpass("New password (empty = no password): ")
+            if not pw and cfg["access"] == "network":
+                print("Access from the local network needs a password.")
+                return 1
             set_password(cfg, pw)
         changed = True
+    new_password = ensure_network_password(cfg)
+    changed = changed or bool(new_password)
     if changed:
         save_config(cfg)
-        control("reload")
+        if control("reload") is None and cfg["port"] != old_port:
+            print(serve_follow_port(old_port, cfg["port"]) or "", end="")
         print("Saved.")
+    if new_password:
+        print("Local network access needs a password, so TailWake made one: %s\n"
+              "Change it with: tailwake config --password" % new_password)
     print("port:              %d" % cfg["port"])
     print("access:            %s" % ("Tailscale devices only" if cfg["access"] == "tailscale"
                                      else "Tailscale devices + local network"))
@@ -2269,7 +2727,8 @@ def cmd_tailscale(args) -> int:
         print("Tailscale is installed but not connected (%s)." % (info["state"] or "stopped"))
         return 1
     print("Connected to Tailscale as %s (%s)." % (info["dns"] or "?", info["ip"]))
-    for u in page_urls(load_config(), info):
+    cfg = load_config()
+    for u in page_urls(cfg, info) + serve_urls(serve_config() or {}, cfg["port"]):
         print("Page: " + u)
     return 0
 

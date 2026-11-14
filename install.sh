@@ -4,9 +4,9 @@
 #   curl -LsSf https://raw.githubusercontent.com/onetrickpony1/tailwake/main/install.sh | sh
 #
 # It checks what is missing and asks before installing anything:
-#   1. Python 3.9+ with tkinter (needed)   2. the tray icon packages, privately in TailWake's own folder (recommended)
-# then saves tailwake.py to ~/.local/share/tailwake, adds a `tailwake` command, a menu entry (Linux) or
-# ~/Applications/TailWake.app (macOS), and offers start at login.
+#   1. Python 3.10+ with tkinter (needed)   2. the tray icon packages, privately in TailWake's own folder (recommended)
+# then downloads and checks tailwake.py, saves it to ~/.local/share/tailwake, adds a `tailwake` command, a menu entry
+# (Linux) or ~/Applications/TailWake.app (macOS), and offers start at login.
 # Run it again to update. Uninstall: `tailwake autostart off`, `tailwake stop`, then delete ~/.local/share/tailwake,
 # ~/.local/bin/tailwake and the menu entry / app.
 set -eu
@@ -28,7 +28,7 @@ ask() {   # ask "question" default(y/n) -> 0 for yes; no terminal or CI -> defau
     [ -z "$ans" ] && ans="$2"
     case "$ans" in [Yy]*) return 0 ;; *) return 1 ;; esac
 }
-py_ok() { python3 -c "import sys; sys.exit(sys.version_info < (3, 9))" >/dev/null 2>&1; }
+py_ok() { python3 -c "import sys; sys.exit(sys.version_info < (3, 10))" >/dev/null 2>&1; }
 have_tk() { python3 -c "import tkinter" >/dev/null 2>&1; }
 
 # Run a package-manager command, with sudo if we are not root.
@@ -47,12 +47,12 @@ install_pkg() {
 
 say "Installing TailWake"
 
-# 1. Python 3.9+ with tkinter (needed)
+# 1. Python 3.10+ with tkinter (needed)
 if ! command -v python3 >/dev/null 2>&1 || ! py_ok; then
-    ask "Python 3.9 or newer is missing and TailWake needs it. Install it now (may ask for your password)? [Y/n]" y \
-        || fail "Python 3.9+ is required"
+    ask "Python 3.10 or newer is missing and TailWake needs it. Install it now (may ask for your password)? [Y/n]" y \
+        || fail "Python 3.10+ is required"
     install_pkg "Python 3" python3 python3 python python@3.13 || fail "could not install Python 3"
-    py_ok || fail "Python 3.9+ still isn't available; please install it and run this again"
+    py_ok || fail "Python 3.10+ still isn't available; please install it and run this again"
 fi
 if ! have_tk; then
     ask "Python's tkinter (needed for the settings window) is missing. Install it now? [Y/n]" y \
@@ -61,9 +61,22 @@ if ! have_tk; then
     have_tk || fail "tkinter still can't be imported; please install it for your Python and run this again"
 fi
 
-# 2. TailWake's own Python environment (keeps the tray packages away from your system Python)
-"$BIN/tailwake" stop >/dev/null 2>&1 || true
+# 2. download the app first: if that fails, the installed TailWake is left as it was (and keeps running)
 mkdir -p "$DIR" "$BIN"
+NEW="$DIR/tailwake.py.new"
+say "Downloading tailwake.py"
+if [ -f "${TAILWAKE_SOURCE:-}" ]; then cp "$TAILWAKE_SOURCE" "$NEW"
+elif command -v curl >/dev/null 2>&1; then curl -LsSf "$URL" -o "$NEW" || { rm -f "$NEW"; fail "the download failed; your existing TailWake was left as it was"; }
+elif command -v wget >/dev/null 2>&1; then wget -qO "$NEW" "$URL" || { rm -f "$NEW"; fail "the download failed; your existing TailWake was left as it was"; }
+else fail "needs curl or wget to download the app"
+fi
+if ! python3 -c "import sys; compile(open(sys.argv[1], 'rb').read(), 'tailwake.py', 'exec')" "$NEW" >/dev/null 2>&1; then
+    rm -f "$NEW"
+    fail "the downloaded file is not valid Python; your existing TailWake was left as it was"
+fi
+
+# 3. TailWake's own Python environment (keeps the tray packages away from your system Python)
+"$BIN/tailwake" stop >/dev/null 2>&1 || true
 if [ ! -x "$DIR/venv/bin/python" ]; then
     say "Creating TailWake's private Python environment"
     if ! python3 -m venv --system-site-packages "$DIR/venv" >/dev/null 2>&1; then
@@ -90,18 +103,12 @@ if [ "$OS" = "Linux" ] && ! "$PY" -c "import gi" >/dev/null 2>&1; then
     fi
 fi
 
-# 3. the app
-say "Downloading tailwake.py"
-if [ -f "${TAILWAKE_SOURCE:-}" ]; then cp "$TAILWAKE_SOURCE" "$DIR/tailwake.py"
-elif command -v curl >/dev/null 2>&1; then curl -LsSf "$URL" -o "$DIR/tailwake.py"
-elif command -v wget >/dev/null 2>&1; then wget -qO "$DIR/tailwake.py" "$URL"
-else fail "needs curl or wget to download the app"
-fi
-"$PY" -m py_compile "$DIR/tailwake.py" || fail "the downloaded file is not valid Python"
+# 4. the app: put the checked download in place
+mv -f "$NEW" "$DIR/tailwake.py"
 printf '#!/bin/sh\nexec "%s" "%s/tailwake.py" "$@"\n' "$PY" "$DIR" > "$BIN/tailwake"
 chmod +x "$BIN/tailwake"
 
-# 4. menu entry / app
+# 5. menu entry / app
 if [ -z "${CI:-}" ]; then
     if [ "$OS" = "Linux" ] && ask "Add TailWake to your applications menu? [Y/n]" y; then
         mkdir -p "$HOME/.local/share/applications"
@@ -126,12 +133,12 @@ PLIST
     fi
 fi
 
-# 5. Tailscale
+# 6. Tailscale
 if ! command -v tailscale >/dev/null 2>&1 && [ ! -e /Applications/Tailscale.app ]; then
     printf '\nNote: Tailscale was not found. Install it on this computer AND your phone: https://tailscale.com/download\n'
 fi
 
-# 6. start at login, start now
+# 7. start at login, start now
 if [ -z "${CI:-}" ]; then
     if ask "Start TailWake automatically when you log in? [Y/n]" y; then
         "$BIN/tailwake" autostart on || true

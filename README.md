@@ -18,14 +18,15 @@ No port forwarding, no cloud service, no account: only devices signed in to your
   Works in light and dark mode; add it to your home screen for a one-tap button.
 - **Tailscale built in:** shows the MagicDNS and 100.x addresses, answers only Tailscale devices by default, and can
   turn on a tailnet-only `https://…ts.net` address (Tailscale Serve) with one button.
-- **Optional password**, optional access from the local network as well, notifications when a woken device comes up.
+- **Optional password** (required, and made for you, if the local network can open the page too), a lock-out after
+  repeated wrong passwords, notifications when a woken device comes up.
 - **Start at login** with one click: Windows sign-in, macOS LaunchAgent, Linux autostart or a systemd user service
   for computers without a desktop.
 - **Command line** for everything: `start`, `stop`, `restart`, `status`, `wake`, `add`, `scan`, `autostart`…
 
 ## Install
 
-One line, no admin rights needed. It checks for Python 3.9+ with tkinter and **asks before installing anything that
+One line, no admin rights needed. It checks for Python 3.10+ with tkinter and **asks before installing anything that
 is missing**, keeps the tray packages in TailWake's own folder, adds a `tailwake` command and a menu entry, and offers
 start at login.
 
@@ -39,7 +40,8 @@ powershell -ExecutionPolicy ByPass -c "irm https://raw.githubusercontent.com/one
 curl -LsSf https://raw.githubusercontent.com/onetrickpony1/tailwake/main/install.sh | sh
 ```
 
-Run the same line again to update. Or skip the installer: `pip install pystray Pillow` (optional) and run
+Run the same line again to update. The new version is downloaded and checked before anything is replaced, so a failed
+download leaves the installed TailWake as it was. Or skip the installer: `pip install pystray Pillow` (optional) and run
 `python3 tailwake.py`.
 
 You also need **Tailscale** on this computer and on your phone or laptop: <https://tailscale.com/download>.
@@ -89,12 +91,20 @@ TailWake runs without a tray icon when there is no desktop. Add devices with `ta
 ## Notes
 
 - **Who can open the page.** By default only Tailscale addresses (100.64.0.0/10) and this computer are answered.
-  "Tailscale devices and anyone on this local network" also lets in private LAN addresses. A password adds a login
-  on top. Tailscale ACLs still apply: devices your tailnet policy blocks can't reach the page at all.
+  "Tailscale devices and anyone on this local network" also lets in addresses on this computer's own local networks
+  (not every private range), and needs a password: if none is set, TailWake makes one and shows it once. If your local
+  network itself uses 100.64.0.0/10 addresses, TailWake asks `tailscale whois` before treating one as a Tailscale
+  device. Tailscale ACLs still apply: devices your tailnet policy blocks can't reach the page at all.
+- **Only answers to its own names.** The page only answers requests addressed to an IP address, `localhost`, this
+  computer's name (or `name.local`) or its MagicDNS name, which stops other websites from reaching it through DNS
+  rebinding. Five wrong passwords from one address lock that address out for a minute, doubling up to an hour.
 - **HTTPS address.** "Turn HTTPS address on" runs `tailscale serve`, which gives the page a
-  `https://<name>.<tailnet>.ts.net/` address, still visible only inside your tailnet. Your tailnet needs HTTPS
-  certificates turned on (admin console → DNS). On Linux, allow your user once with
+  `https://<name>.<tailnet>.ts.net/` address, still visible only inside your tailnet. If Tailscale Serve already
+  shares something else on port 443, TailWake uses port 8443 (or 10000) instead and leaves it alone; "Turn it off"
+  removes only TailWake's own entry. If you change TailWake's port, the HTTPS address follows. Your tailnet needs
+  HTTPS certificates turned on (admin console → DNS). On Linux, allow your user once with
   `sudo tailscale set --operator=$USER`.
+- **Port.** 1024 to 65535 (lower ports need admin rights on Linux and macOS).
 - **Online / offline.** TailWake pings the device, tries a few common ports, and checks this computer's address table
   for the device's MAC address, so a PC that blocks ping still shows as online. Right after a device turns off, it can
   take a minute or two to show as offline (on macOS up to 20 minutes, if it also blocks ping).
